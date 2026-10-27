@@ -16,6 +16,9 @@ import torch
 from lmcache import device_ops, torch_dev, torch_device_type
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.kv_format import detect_format
+from lmcache.v1.gpu_connector.utils import (
+    assert_is_vllm_mla_or_flash_attn_or_flash_infer,
+)
 import lmcache.lmcache_native as lmcache_native
 
 cuda_only = pytest.mark.skipif(
@@ -124,3 +127,85 @@ def test_kernel_roundtrip_matches_torch(order, pad_layers):
             assert torch.equal(buf[b, :NL, :, used], original[b, :NL, :, used])
         else:
             assert torch.equal(buf[b, :NL, used], original[b, :NL, used])
+
+
+@cuda_only
+@pytest.mark.parametrize("order", ["NHD", "HND", "BLNHC", "BLHNC"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("token_major", [True, False])
+@pytest.mark.parametrize("staging_device", ["cpu", "cuda"])
+def test_single_layer_fused_roundtrip(
+    order: str, dtype: torch.dtype, token_major: bool, staging_device: str
+) -> None:
+    """Match independent K/V gathers and preserve unmapped slots and layers.
+
+    Cover tight and padded block-outer pools, both LMCache staging orders,
+    pinned CPU and GPU staging, and the negative-slot skip contract.
+    """
+    hnd = order in ("HND", "BLHNC")
+    block_outer = order.startswith("BL")
+    inner = (NH, BS, CS) if hnd else (BS, NH, CS)
+    shape = (NB, NL + 2, *inner) if block_outer else (NL, NB, *inner)
+    source = torch.randn(shape, dtype=dtype, device="cuda")
+    target = torch.full_like(source, -3)
+    reference = source.cpu()
+    expected_target = target.cpu()
+    source_views = [source[:, i] if block_outer else source[i] for i in range(NL)]
+    target_views = [target[:, i] if block_outer else target[i] for i in range(NL)]
+    fmt, source_views = detect_format(
+        source_views, EngineType.VLLM, {"kv_layout": order}
+    )
+    assert_is_vllm_mla_or_flash_attn_or_flash_infer(fmt)
+    slots = [5, -1, 6, 15, 28, 0]
+    slot_mapping = torch.tensor(slots, dtype=torch.int64, device="cuda")
+    staging_shape = (
+        (len(slots), 2, NH * CS // 2) if token_major else (2, len(slots), NH * CS // 2)
+    )
+
+    for layer in range(NL):
+        staging = torch.full(
+            staging_shape,
+            -7,
+            dtype=dtype,
+            device=staging_device,
+            pin_memory=staging_device == "cpu",
+        )
+        expected = torch.full((len(slots), 2, NH * CS // 2), -7, dtype=dtype)
+        ref_layer = reference[:, layer] if block_outer else reference[layer]
+        dst_layer = expected_target[:, layer] if block_outer else expected_target[layer]
+        for token, slot in enumerate(slots):
+            if slot < 0:
+                continue
+            block, offset = divmod(slot, BS)
+            packed = ref_layer[block, :, offset] if hnd else ref_layer[block, offset]
+            keys, values = packed.split(CS // 2, dim=-1)
+            expected[token, 0] = keys.flatten()
+            expected[token, 1] = values.flatten()
+            if hnd:
+                dst_layer[block, :, offset] = packed
+            else:
+                dst_layer[block, offset] = packed
+
+        device_ops.single_layer_kv_transfer(
+            staging,
+            source_views[layer],
+            slot_mapping,
+            lmcache_native.TransferDirection.D2H,
+            fmt,
+            token_major,
+        )
+        torch_dev.synchronize()
+        assert torch.equal(
+            staging.cpu(), expected if token_major else expected.transpose(0, 1)
+        )
+        device_ops.single_layer_kv_transfer(
+            staging,
+            target_views[layer],
+            slot_mapping,
+            lmcache_native.TransferDirection.H2D,
+            fmt,
+            token_major,
+        )
+        torch_dev.synchronize()
+
+    assert torch.equal(target.cpu(), expected_target)

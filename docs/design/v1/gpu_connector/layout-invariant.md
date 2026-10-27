@@ -245,6 +245,15 @@ consumer code must never do any of the following — it queries via the
 
 ## Consumers
 
+The CUDA paged in-process layerwise connector accepts the fused-content
+formats `NL_X_NB_BS_NH_CS` and `NL_X_NB_NH_BS_CS`. The existing single-layer
+transfer kernel separates K/V directly while copying into LMCache staging,
+and packs them on the reverse transfer. It reads the real per-block stride,
+so layer-compact and block-outer pools share the same path. The staging
+format and generator/stream protocol are unchanged; there is no additional
+repacking allocation. This does not add fused-layout support to CacheBlend
+or other device backends.
+
 - **`lmcache/v1/kv_layer_groups.py::KVLayerGroupsManager.__init__`** —
   partitions layers by the 5-tuple `(kv_size, num_heads, head_size,
   block_size, dtype)` using `is_mla`, `get_num_heads`, `get_head_size`,

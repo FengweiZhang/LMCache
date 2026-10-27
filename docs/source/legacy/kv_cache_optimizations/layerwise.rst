@@ -10,6 +10,15 @@ The storage and loading of KV Cache on a layer granularity is a key optimization
 
 CacheBlend is implemented on top of the layerwise codepath in order to pipeline recompute and loading to mask the latency of loading KV Cache.
 
+The CUDA paged layerwise connector also accepts vLLM's fused K/V layouts:
+``LBNHC`` / ``NHD`` and ``LBHNC`` / ``HND``, including the block-outer
+``BLNHC`` and ``BLHNC`` variants. Each head stores K followed by V in
+the trailing content dimension. The single-layer transfer kernel converts
+these to and from LMCache's existing K/V staging layout without a separate
+repacking buffer. Rebuild the CUDA extension after updating the source;
+no additional configuration flag is required. This support does not
+extend to CacheBlend or non-CUDA layerwise connectors.
+
 .. image:: /_static/basic_codepath.svg
    :alt: Basic Codepath
    :class: scalable

@@ -441,6 +441,8 @@ def assert_is_vllm_mla_or_flash_attn_or_flash_infer(
         - ``NL_X_NB_TWO_BS_NH_HS`` (flash infer, NHD)
         - ``NL_X_TWO_NB_NH_BS_HS`` (flash attention, HND)
         - ``NL_X_NB_TWO_NH_BS_HS`` (flash infer, HND)
+        - ``NL_X_NB_BS_NH_CS`` (fused K/V, NHD)
+        - ``NL_X_NB_NH_BS_CS`` (fused K/V, HND)
         - ``NL_X_NB_BS_HS`` (MLA)
 
     Raises:
@@ -453,6 +455,8 @@ def assert_is_vllm_mla_or_flash_attn_or_flash_infer(
         lmcache_native.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS,
         lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
         lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS,
+        lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
+        lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS,
     )
 
 

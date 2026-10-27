@@ -31,10 +31,7 @@ namespace lmc {
 // inline helper to check HND layout (callable from device and host)
 __host__ __device__ __forceinline__ bool is_hnd(
     const EngineKVFormat engine_kv_format) {
-  return engine_kv_format ==
-             EngineKVFormat::NL_X_TWO_NB_NH_BS_HS ||  // flash attn HND
-         engine_kv_format ==
-             EngineKVFormat::NL_X_NB_TWO_NH_BS_HS;  // flash infer HND
+  return format_facts(engine_kv_format).is_hnd;
 }
 
 // All paged (non-MLA) formats rely on block_size for offset computation.
@@ -154,8 +151,9 @@ __global__ void single_layer_kv_transfer_kernel(
     const int head_size_in_64bit, const int block_size,
     const TransferDirection direction) {
   constexpr bool USE_MLA = (format == EngineKVFormat::NL_X_NB_BS_HS);
-  constexpr bool HND_LAYOUT = (format == EngineKVFormat::NL_X_TWO_NB_NH_BS_HS ||
-                               format == EngineKVFormat::NL_X_NB_TWO_NH_BS_HS);
+  constexpr bool HND_LAYOUT = format_facts(format).is_hnd;
+  constexpr bool FUSED_KV = is_fused_packed(format);
+  const int head_stride = head_size_in_64bit * (FUSED_KV ? 2 : 1);
 
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
@@ -178,14 +176,14 @@ __global__ void single_layer_kv_transfer_kernel(
     if constexpr (HND_LAYOUT) {
       // HND layout: [..., num_heads, block_size, head_size]
       vllm_key_idx = block_idx * vllm_block_key_stride_in_64bit +
-                     head_idx * block_size * head_size_in_64bit +
-                     block_offset * head_size_in_64bit + head_offset;
+                     head_idx * block_size * head_stride +
+                     block_offset * head_stride + head_offset;
     } else {
       // NHD layout: [..., block_size, num_heads, head_size]
       // (also correct for MLA where num_heads==1)
       vllm_key_idx = block_idx * vllm_block_key_stride_in_64bit +
-                     block_offset * num_heads * head_size_in_64bit +
-                     head_idx * head_size_in_64bit + head_offset;
+                     block_offset * num_heads * head_stride +
+                     head_idx * head_stride + head_offset;
     }
 
     if (direction == TransferDirection::D2H) {
@@ -873,6 +871,10 @@ void single_layer_kv_transfer(
                                //       head_size] for flash attention
                                //      [num_blocks, 2, num_heads, block_size,
                                //       head_size] for flash infer
+                               // fused NHD: [num_blocks, block_size, num_heads,
+                               //             2 * head_size]
+                               // fused HND: [num_blocks, num_heads, block_size,
+                               //             2 * head_size]
                                // MLA: [num_blocks, block_size, head_size]
 
     torch::Tensor& slot_mapping,  // [num_tokens]
@@ -905,8 +907,14 @@ void single_layer_kv_transfer(
 
   const bool use_mla = ::is_mla(engine_kv_format);
   const bool hnd_layout = lmc::is_hnd(engine_kv_format);
+  const bool fused_kv = ::is_fused_packed(engine_kv_format);
 
-  if (use_mla) {
+  if (fused_kv) {
+    num_heads = vllm_key_value_cache.size(hnd_layout ? 1 : 2);
+    block_size = vllm_key_value_cache.size(hnd_layout ? 2 : 1);
+    head_size_in_64bit =
+        vllm_key_value_cache.size(3) / (2 * elements_per_entry);
+  } else if (use_mla) {
     // MLA format: [num_blocks, block_size, head_size]
     num_heads = 1;
     block_size = vllm_key_value_cache.size(1);
@@ -942,7 +950,12 @@ void single_layer_kv_transfer(
 
   int vllm_block_key_stride_in_64bit;
   int vllm_value_offset;
-  if (use_mla) {
+  if (fused_kv) {
+    // stride(0) also covers block-outer pools with other layers between blocks.
+    vllm_block_key_stride_in_64bit =
+        vllm_key_value_cache.stride(0) / elements_per_entry;
+    vllm_value_offset = head_size_in_64bit;
+  } else if (use_mla) {
     // MLA format: [num_blocks, block_size, head_size]
     vllm_block_key_stride_in_64bit =
         vllm_key_value_cache.stride(0) / elements_per_entry;
@@ -988,6 +1001,10 @@ void single_layer_kv_transfer(
       LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_TWO_NB_NH_BS_HS)
     case EngineKVFormat::NL_X_NB_TWO_NH_BS_HS:
       LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_NB_TWO_NH_BS_HS)
+    case EngineKVFormat::NL_X_NB_BS_NH_CS:
+      LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_NB_BS_NH_CS)
+    case EngineKVFormat::NL_X_NB_NH_BS_CS:
+      LAUNCH_SINGLE_LAYER_KERNEL(EngineKVFormat::NL_X_NB_NH_BS_CS)
     default:
       TORCH_CHECK(false,
                   "Unsupported EngineKVFormat for single_layer_kv_transfer: ",
