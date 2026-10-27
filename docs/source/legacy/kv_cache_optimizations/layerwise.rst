@@ -19,6 +19,12 @@ repacking buffer. Rebuild the CUDA extension after updating the source;
 no additional configuration flag is required. This support does not
 extend to CacheBlend or non-CUDA layerwise connectors.
 
+For local CPU cache hits, layerwise retrieval releases only the references
+acquired by the read. Pins owned by a lookup remain until that request calls
+``lookup_unpin(lookup_id)``; retrieving a shared chunk must not release
+another request's or controller's pin. Disk-loaded temporary staging buffers
+still release their own pins after the layerwise consumer's sync point.
+
 .. image:: /_static/basic_codepath.svg
    :alt: Basic Codepath
    :class: scalable

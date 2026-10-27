@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU regressions for lookup-pin ownership during non-layerwise retrieval.
+"""CPU regressions for lookup-pin ownership during synchronous retrieval.
 
 Blocking LocalCPUBackend reads acquire references, not pins. Only lookup_unpin
 may release the pins recorded by synchronous lookup, even when another request
@@ -10,6 +10,7 @@ separate ownership contracts.
 # Standard
 from collections import OrderedDict
 from collections.abc import Generator, Sequence
+from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -26,6 +27,9 @@ import torch
 from lmcache.inprocess.v1.cache_engine import LMCacheEngine
 from lmcache.inprocess.v1.event_manager import EventStatus, EventType
 from lmcache.inprocess.v1.gpu_connector import GPUConnectorInterface
+from lmcache.inprocess.v1.gpu_connector.gpu_connectors import (
+    VLLMPagedMemLayerwiseGPUConnector,
+)
 from lmcache.inprocess.v1.pin_monitor import PinMonitor
 from lmcache.inprocess.v1.token_database import ChunkedTokenDatabase
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
@@ -104,6 +108,26 @@ class _SynchronousStorageManager(StorageManager):
         self._bypassed_backends: set[str] = set()
         self._bypass_lock = threading.RLock()
 
+    def layerwise_batched_get(
+        self, keys: list[list[CacheEngineKey]], location: str | None = None
+    ) -> Generator[Future[list[MemoryObj]], None, None]:
+        """Execute real backend reads inline, replacing only event-loop scheduling.
+
+        Args:
+            keys: Keys grouped by layer.
+            location: Selected backend; None selects the CPU cache.
+
+        Yields:
+            Completed futures with the backend's original object ownership.
+        """
+        backend = self.storage_backends[location or LOCATION]
+        for layer_keys in keys:
+            future: Future[list[MemoryObj]] = Future()
+            future.set_result(
+                asyncio.run(backend.batched_get_non_blocking("layerwise", layer_keys))
+            )
+            yield future
+
 
 @dataclass
 class _CacheCase:
@@ -139,7 +163,7 @@ def pin_monitor() -> Generator[None, None, None]:
 
 @pytest.fixture
 def cache_case(
-    monkeypatch: pytest.MonkeyPatch, pin_monitor: None
+    monkeypatch: pytest.MonkeyPatch, pin_monitor: None, request: pytest.FixtureRequest
 ) -> Generator[_CacheCase, None, None]:
     """Build three tiny CPU chunks with one cache reference apiece.
 
@@ -150,6 +174,7 @@ def cache_case(
     Args:
         monkeypatch: Restores the isolated dependency replacements after the test.
         pin_monitor: Keeps the real monitor alive through object cleanup.
+        request: Optional indirect parameter enables two-layer cache keys.
 
     Yields:
         The engine, backend, copy recorder, tokens, keys and corresponding objects.
@@ -163,11 +188,13 @@ def cache_case(
     monkeypatch.setattr(
         cache_engine_module.multiprocessing, "set_start_method", MagicMock()
     )
+    layerwise = getattr(request, "param", False)
+    num_layers = 2 if layerwise else 1
     config = LMCacheEngineConfig.from_defaults(
         chunk_size=CHUNK_SIZE,
         local_cpu=True,
         enable_async_loading=False,
-        use_layerwise=False,
+        use_layerwise=layerwise,
         py_enable_gc=True,
         lmcache_instance_id="test_retrieve_pin_ownership",
     )
@@ -178,11 +205,13 @@ def cache_case(
         worker_id=0,
         local_worker_id=0,
         kv_dtype=torch.bfloat16,
-        kv_shape=(1, 2, CHUNK_SIZE, 1, 1),
+        kv_shape=(num_layers, 2, CHUNK_SIZE, 1, 1),
         chunk_size=CHUNK_SIZE,
     )
     token_database = ChunkedTokenDatabase(config, metadata)
-    connector = MagicMock(spec=GPUConnectorInterface)
+    connector = MagicMock(
+        spec=VLLMPagedMemLayerwiseGPUConnector if layerwise else GPUConnectorInterface
+    )
     engine = LMCacheEngine(
         config, metadata, token_database, connector, MagicMock(), MagicMock()
     )
@@ -196,12 +225,16 @@ def cache_case(
     try:
         for _, _, key in token_database.process_tokens(tokens=tokens):
             assert isinstance(key, CacheEngineKey)
-            memory_obj = create_test_memory_obj(shape=torch.Size([2, CHUNK_SIZE, 1, 1]))
-            keys.append(key)
-            memory_objs.append(memory_obj)
-            backend.submit_put_task(key, memory_obj)
-            memory_obj.ref_count_down()  # Transfer allocation ownership to the cache.
-        _assert_counts(memory_objs, [0, 0, 0])
+            chunk_keys = key.split_layers(num_layers) if layerwise else [key]
+            for chunk_key in chunk_keys:
+                memory_obj = create_test_memory_obj(
+                    shape=torch.Size([2, CHUNK_SIZE, 1, 1])
+                )
+                keys.append(chunk_key)
+                memory_objs.append(memory_obj)
+                backend.submit_put_task(chunk_key, memory_obj)
+                memory_obj.ref_count_down()  # Allocation ownership moves to the cache.
+        _assert_counts(memory_objs, [0] * len(memory_objs))
         yield _CacheCase(engine, backend, connector, tokens, keys, memory_objs)
     finally:
         # Failed baseline assertions must not leak pins into the next test. Tests
@@ -499,6 +532,97 @@ def test_unforced_remove_keeps_lookup_pin(cache_case: _CacheCase) -> None:
 
 
 # Existing cleanup contracts outside active synchronous retrieval
+
+
+@pytest.mark.parametrize("cache_case", [True], indirect=True)
+@pytest.mark.parametrize("lookup_owners", [(), ("A",), ("A", "B")])
+@pytest.mark.parametrize("controller_pin", [False, True])
+@pytest.mark.parametrize("skip_first_chunk", [False, True])
+def test_layerwise_retrieve_preserves_lookup_and_controller_pins(
+    cache_case: _CacheCase,
+    lookup_owners: tuple[str, ...],
+    controller_pin: bool,
+    skip_first_chunk: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Layerwise reads release references without consuming any existing pin.
+
+    Args:
+        cache_case: Two-layer real CPU cache and recording GPU consumer.
+        lookup_owners: Requests sharing each cached chunk before retrieval.
+        controller_pin: Whether an independent controller also owns a pin.
+        skip_first_chunk: Whether the first chunk is already resident on the GPU.
+        caplog: Captures repeated-unpin warnings during request cleanup.
+    """
+    engine = cache_case.engine
+    objects = cache_case.memory_objs
+    caplog.set_level(logging.WARNING, logger="lmcache")
+    for owner in lookup_owners:
+        assert engine.lookup(cache_case.tokens, lookup_id=owner, pin=True) == 12
+    if controller_pin:
+        for key in cache_case.keys:
+            assert cache_case.backend.pin(key)
+    pin_count = len(lookup_owners) + int(controller_pin)
+    mask = torch.arange(12) >= (CHUNK_SIZE if skip_first_chunk else 0)
+
+    result = list(engine.retrieve_layer(cache_case.tokens, mask, req_id="A"))[-1]
+
+    assert torch.equal(result, mask)
+    _assert_counts(objects, [pin_count] * len(objects))
+    assert (
+        len(cache_case.connector.batched_to_gpu.return_value.send.call_args_list) == 2
+    )
+    for owner in lookup_owners:
+        engine.lookup_unpin(owner)
+        engine.lookup_unpin(owner)
+        pin_count -= 1
+        _assert_counts(objects, [pin_count] * len(objects))
+    if controller_pin:
+        for key in cache_case.keys:
+            assert cache_case.backend.unpin(key)
+    _assert_counts(objects, [0] * len(objects))
+    assert not engine.lookup_pins
+    assert "Double unpin" not in caplog.text
+
+
+@pytest.mark.parametrize("cache_case", [True], indirect=True)
+def test_layerwise_retrieve_releases_disk_staging_pin(
+    cache_case: _CacheCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Temporary disk-read buffers still release their own pin and reference.
+
+    Args:
+        cache_case: Real lookup bookkeeping and CPU-backed persistent test objects.
+        monkeypatch: Replaces disk I/O with fresh pinned CPU staging objects.
+    """
+    engine = cache_case.engine
+    location = "LocalDiskBackend"
+    engine.storage_manager.storage_backends = OrderedDict(
+        [(location, cache_case.backend)]
+    )
+    staging: list[MemoryObj] = []
+
+    async def read_disk(lookup_id: str, keys: list[CacheEngineKey]) -> list[MemoryObj]:
+        """Model disk reads with buffers distinct from the lookup-pinned entries."""
+        result = [
+            create_test_memory_obj(shape=torch.Size([2, CHUNK_SIZE, 1, 1]))
+            for _ in keys
+        ]
+        for obj in result:
+            obj.pin()
+        staging.extend(result)
+        return result
+
+    monkeypatch.setattr(cache_case.backend, "batched_get_non_blocking", read_disk)
+    assert engine.lookup(cache_case.tokens, lookup_id="A", pin=True) == 12
+
+    assert list(engine.retrieve_layer(cache_case.tokens, req_id="A"))[-1].all()
+
+    assert len(staging) == len(cache_case.memory_objs)
+    _assert_counts(staging, [0] * len(staging), refs=0)
+    _assert_counts(cache_case.memory_objs, [1] * len(cache_case.memory_objs))
+    engine.lookup_unpin("A")
+    _assert_counts(cache_case.memory_objs, [0] * len(cache_case.memory_objs))
 
 
 @pytest.mark.parametrize("completion", ["retrieve", "cancel"])

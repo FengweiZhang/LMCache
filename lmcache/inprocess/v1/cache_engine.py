@@ -1025,6 +1025,10 @@ class LMCacheEngine:
             the memory objects of layer i+1 from the storage backends. In the
             last iteration, it moves the memory objects of the last layer to
             the GPU.
+
+        Local CPU reads release their get references, not lookup-owned pins.
+        The caller releases those pins with ``lookup_unpin(lookup_id)``.
+        Temporary staging pins acquired by other backends are released here.
         """
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
@@ -1127,13 +1131,13 @@ class LMCacheEngine:
         # synchronize the last layer
         next(mem_obj_consumer)
 
-        # Unpin any disk-loaded staging objects now that the device-side sync
-        # has been enqueued (mem_obj_consumer advanced past its sync point).
-        # Without this, pin_count stays at 1 forever and the CPU staging pool
-        # fills up, causing the next retrieve to deadlock inside allocate().
-        for mem_obj in to_count_down:
-            if mem_obj.is_pinned:
-                mem_obj.unpin()
+        # CPU hits borrow lookup/controller pins; their owners release them.
+        # Other backends can return staging pins that must be released after
+        # the consumer's sync point so the staging pool can reclaim the buffers.
+        if location != "LocalCPUBackend":
+            for mem_obj in to_count_down:
+                if mem_obj.is_pinned:
+                    mem_obj.unpin()
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
