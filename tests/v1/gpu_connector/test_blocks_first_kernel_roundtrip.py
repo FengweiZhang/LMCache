@@ -209,3 +209,87 @@ def test_single_layer_fused_roundtrip(
         torch_dev.synchronize()
 
     assert torch.equal(target.cpu(), expected_target)
+
+
+@cuda_only
+@pytest.mark.parametrize("order", ["NHD", "HND", "BLNHC", "BLHNC"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("staging_device", ["cpu", "cuda"])
+def test_multi_layer_fused_split_kv_roundtrip(
+    order: str, dtype: torch.dtype, staging_device: str
+) -> None:
+    """The in-process [2,L,T,D] staging must move both halves of fused KV."""
+    hnd = order in ("HND", "BLHNC")
+    block_outer = order.startswith("BL")
+    inner = (NH, BS, CS) if hnd else (BS, NH, CS)
+    shape = (NB, NL + 2, *inner) if block_outer else (NL, NB, *inner)
+    source = torch.randn(shape, dtype=dtype, device="cuda")
+    target = torch.full_like(source, -3)
+    source_views = [source[:, i] if block_outer else source[i] for i in range(NL)]
+    target_views = [target[:, i] if block_outer else target[i] for i in range(NL)]
+    fmt, source_views = detect_format(
+        source_views, EngineType.VLLM, {"kv_layout": order}
+    )
+    slots = [5, -1, 6, 15, 28, 0]
+    slot_mapping = torch.tensor(slots, dtype=torch.int64, device="cuda")
+    staging = torch.full(
+        (2, NL, len(slots), NH * CS // 2),
+        -7,
+        dtype=dtype,
+        device=staging_device,
+        pin_memory=staging_device == "cpu",
+    )
+    expected = torch.full(staging.shape, -7, dtype=dtype)
+    reference = source.cpu()
+    expected_target = target.cpu()
+    for layer in range(NL):
+        ref = reference[:, layer] if block_outer else reference[layer]
+        dst = expected_target[:, layer] if block_outer else expected_target[layer]
+        for token, slot in enumerate(slots):
+            if slot < 0:
+                continue
+            block, offset = divmod(slot, BS)
+            packed = ref[block, :, offset] if hnd else ref[block, offset]
+            key, value = packed.split(CS // 2, dim=-1)
+            expected[0, layer, token] = key.flatten()
+            expected[1, layer, token] = value.flatten()
+            if hnd:
+                dst[block, :, offset] = packed
+            else:
+                dst[block, offset] = packed
+    source_ptrs = torch.tensor(
+        [v.data_ptr() for v in source_views], dtype=torch.int64, device="cuda"
+    )
+    target_ptrs = torch.tensor(
+        [v.data_ptr() for v in target_views], dtype=torch.int64, device="cuda"
+    )
+    device_ops.multi_layer_kv_transfer(
+        staging,
+        source_ptrs,
+        slot_mapping,
+        torch.device("cuda:0"),
+        NB * BS,
+        lmcache_native.TransferDirection.D2H,
+        fmt,
+        BS,
+        CS // 2,
+        0,
+        source_views[0].stride(0),
+    )
+    torch_dev.synchronize()
+    assert torch.equal(staging.cpu(), expected)
+    device_ops.multi_layer_kv_transfer(
+        staging,
+        target_ptrs,
+        slot_mapping,
+        torch.device("cuda:0"),
+        NB * BS,
+        lmcache_native.TransferDirection.H2D,
+        fmt,
+        BS,
+        CS // 2,
+        0,
+        target_views[0].stride(0),
+    )
+    torch_dev.synchronize()
+    assert torch.equal(target.cpu(), expected_target)

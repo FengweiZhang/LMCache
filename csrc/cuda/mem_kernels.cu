@@ -209,11 +209,11 @@ __global__ void single_layer_kv_transfer_kernel(
 }
 
 template <EngineKVFormat format>
-__device__ __forceinline__ int64_t
-page_buffer_offset(const int k_or_v, const int token_idx,
-                   const int scalar_offset, const int scalars_per_token,
-                   const int page_buffer_size, const int block_size,
-                   const int head_size, const int64_t block_stride_xwords) {
+__device__ __forceinline__ int64_t page_buffer_offset(
+    const int k_or_v, const int token_idx, const int scalar_offset,
+    const int scalars_per_token, const int page_buffer_size,
+    const int block_size, const int head_size,
+    const int64_t block_stride_xwords, const int staging_kv_size) {
   /*
   logical semantics of arguments (agnostic to physical format):
   k_or_v:            0 for key, 1 for value
@@ -228,6 +228,8 @@ page_buffer_offset(const int k_or_v, const int token_idx,
   block_stride_xwords: physical per-block step (xword units) — only used by
   blocks-first cross-layer formats, whose block step spans every layer's
   bytes (and, in HMA-shared pools, other groups' bytes too)
+  staging_kv_size: leading K/V plane count in LMCache staging. Fused paged
+  layouts accept either packed [1,L,T,NH*2*HS] or split [2,L,T,NH*HS].
 
   The job of page_buffer_offset is to translate these logical arguments into a
   physical address based on the EngineKVFormat.
@@ -295,9 +297,14 @@ page_buffer_offset(const int k_or_v, const int token_idx,
     const int hs2 = 2 * head_size;  // packed K+V width per head (xword units)
     const int block_idx = token_idx / block_size;
     const int block_offset = token_idx % block_size;
-    const int head_idx = scalar_offset / hs2;
-    const int head_offset = scalar_offset % hs2;
-    const int num_heads = scalars_per_token / hs2;
+    const int packed_scalar = staging_kv_size == 2
+                                  ? (scalar_offset / head_size) * hs2 +
+                                        k_or_v * head_size +
+                                        scalar_offset % head_size
+                                  : scalar_offset;
+    const int head_idx = packed_scalar / hs2;
+    const int head_offset = packed_scalar % hs2;
+    const int num_heads = scalars_per_token * staging_kv_size / hs2;
     // vLLM blocks-first pools pass the real per-block step; 0 means tight.
     const int64_t block_step =
         block_stride_xwords > 0
@@ -309,14 +316,20 @@ page_buffer_offset(const int k_or_v, const int token_idx,
                        format == EngineKVFormat::NL_X_NB_BS_NH_CS) {
     const int block_idx = token_idx / block_size;
     const int block_offset = token_idx % block_size;
+    const int packed_scalars_per_token = scalars_per_token * staging_kv_size;
+    const int packed_scalar =
+        staging_kv_size == 2
+            ? (scalar_offset / head_size) * 2 * head_size + k_or_v * head_size +
+                  scalar_offset % head_size
+            : scalar_offset;
     // vLLM blocks-first pools pass the real per-block step; 0 means tight.
     const int64_t block_step =
         block_stride_xwords > 0
             ? block_stride_xwords
-            : static_cast<int64_t>(block_size) * scalars_per_token;
+            : static_cast<int64_t>(block_size) * packed_scalars_per_token;
     return block_idx * block_step +
-           static_cast<int64_t>(block_offset) * scalars_per_token +
-           scalar_offset;
+           static_cast<int64_t>(block_offset) * packed_scalars_per_token +
+           packed_scalar;
   }
   // DSA indexer: page [BSxvals][BSxscales]; 4B units, so scale == 1 unit
   else if constexpr (format == EngineKVFormat::NL_X_NB_BSV_BSS) {
@@ -397,7 +410,7 @@ __global__ void load_and_reshape_multi_layer_fused_kernel(
                          num_tokens, num_layers);
     const int64_t vllm_offset = page_buffer_offset<format>(
         k_or_v, slot_idx, i, scalars_per_token, page_buffer_size, block_size,
-        head_size, block_stride_xwords);
+        head_size, block_stride_xwords, k_or_v_size);
     if (DIRECTION)
       chunk.key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
     else
@@ -448,7 +461,7 @@ __global__ void load_and_reshape_multi_layer_kernel(
 
     const int64_t vllm_offset = page_buffer_offset<format>(
         k_or_v, slot_idx, i, scalars_per_token, page_buffer_size, block_size,
-        head_size, block_stride_xwords);
+        head_size, block_stride_xwords, gridDim.z);
 
     if (DIRECTION)  // 1 is paged buffer to LMCache
       key_value[lmcache_offset] = paged_buffer_ptr[vllm_offset];
@@ -551,10 +564,15 @@ void multi_layer_kv_transfer_templated(
       "NL_X_NB_BSV_BSS requires 4-byte transfer units (row bytes "
       "must be divisible by 4 and not by 8)");
 
-  // Fused packs K+V in the trailing dim (kv_size == 1, like MLA): single pass.
-  int k_or_v_size =
-      (::is_mla(engine_kv_format) || ::is_fused_packed(engine_kv_format)) ? 1
-                                                                          : 2;
+  // Staging geometry is independent of the paged pool's fused K/V layout.
+  const int k_or_v_size = key_value.size(0);
+  TORCH_CHECK(::is_fused_packed(engine_kv_format)
+                  ? (k_or_v_size == 1 || k_or_v_size == 2)
+                  : k_or_v_size == (::is_mla(engine_kv_format) ? 1 : 2),
+              "Invalid K/V plane count for the transfer format");
+  TORCH_CHECK(!::is_fused_packed(engine_kv_format) || k_or_v_size != 2 ||
+                  (head_size_xword > 0 && num_xwords % head_size_xword == 0),
+              "Split K/V staging requires an aligned positive head_size");
 
   dim3 grid(num_transfer_tokens, num_layers, k_or_v_size);
   dim3 block(std::min(num_xwords, 128));
