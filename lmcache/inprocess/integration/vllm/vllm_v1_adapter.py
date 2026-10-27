@@ -848,6 +848,7 @@ class LMCacheConnectorV1Impl:
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
+                        req_id=request.req_id,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
@@ -977,6 +978,8 @@ class LMCacheConnectorV1Impl:
         paged buffer.
 
         This interface will be useful for layer-by-layer pipelining.
+        Completed retrievers are retired after the final layer so subsequent
+        decode forwards cannot advance an exhausted prefill iterator.
 
         Args:
             layer_name: the name of that layer
@@ -995,6 +998,8 @@ class LMCacheConnectorV1Impl:
 
         if self.layerwise_retrievers:
             self.current_layer += 1
+            if self.current_layer == self.num_layers:
+                self.layerwise_retrievers.clear()
 
         return
 
